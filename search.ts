@@ -1,71 +1,93 @@
 // ═══════════════════════════════════════════════════
-//  Rate limiting + suscripciones
-//  En Vercel serverless usamos un Map en memoria
-//  Para producción real → reemplazar con Redis/KV
+//  Motor de búsqueda en base normativa local
+//  Sin IA — puro keyword scoring sobre 3.820 artículos
 // ═══════════════════════════════════════════════════
 
-// Vercel KV (opcional) — descomenta si tienes @vercel/kv
-// import { kv } from '@vercel/kv';
+import baseRaw from '../data/base_normativa.json';
 
-interface UsageEntry {
-  date: string;
-  count: number;
+export interface Article {
+  n: string;   // número
+  src: string; // CC | CPC | CPP | CT | L21719
+  t: string;   // título
+  c: string;   // contenido
+  url?: string;
 }
 
-// En memoria (se resetea en cada cold start de Vercel)
-// Para persistencia real usa Vercel KV o una DB
-const USAGE_MAP = new Map<string, UsageEntry>();
+export const SRCS: Record<string, { label: string; url: string; color: string }> = {
+  CT:     { label: 'Código del Trabajo',        url: 'https://bcn.cl/2i6b1',   color: '#1A7F5A' },
+  CC:     { label: 'Código Civil',              url: 'https://bcn.cl/S3XGRc',  color: '#0B2B5C' },
+  CPC:    { label: 'Cód. Procedimiento Civil',  url: 'https://bcn.cl/3lf95',   color: '#2D6FBF' },
+  CPP:    { label: 'Cód. Procesal Penal',       url: 'https://bcn.cl/CSj9FH',  color: '#8B4513' },
+  L21719: { label: 'Ley 21.719',               url: 'https://bcn.cl/gJo3hf',  color: '#C9A84C' },
+};
 
-const FREE_LIMIT = parseInt(process.env.FREE_LIMIT || '5');
-
-// Números Pro separados por coma en env var
-function getProNumbers(): Set<string> {
-  const raw = process.env.PRO_NUMBERS || '';
-  return new Set(raw.split(',').map(n => n.trim()).filter(Boolean));
+// Normaliza texto para búsqueda
+function normalize(s: string): string {
+  return s.toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[°º]/g, '').replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ').trim();
 }
 
-function today(): string {
-  return new Date().toISOString().slice(0, 10);
-}
+const STOP = new Set([
+  'que','del','las','los','una','con','para','por','como','son',
+  'sus','este','esta','estos','estas','hay','mas','pero','sin',
+  'sobre','entre','ante','bajo','desde','hasta','todo','toda',
+  'otro','otra','dicho','dicha','sera','sido','siendo',
+]);
 
-function normalizePhone(phone: string): string {
-  // Baileys entrega formato: 56912345678@s.whatsapp.net
-  return phone.replace('@s.whatsapp.net', '').replace('@c.us', '');
-}
-
-export function isPro(rawPhone: string): boolean {
-  const phone = normalizePhone(rawPhone);
-  const proNums = getProNumbers();
-  return proNums.has(phone) || proNums.has('+' + phone) || proNums.has(phone.replace(/\D/g, ''));
-}
-
-export function canQuery(rawPhone: string): boolean {
-  if (isPro(rawPhone)) return true;
-  const phone = normalizePhone(rawPhone);
-  const entry = USAGE_MAP.get(phone);
-  if (!entry || entry.date !== today()) return true;
-  return entry.count < FREE_LIMIT;
-}
-
-export function incrementUsage(rawPhone: string): void {
-  const phone = normalizePhone(rawPhone);
-  const entry = USAGE_MAP.get(phone);
-  if (!entry || entry.date !== today()) {
-    USAGE_MAP.set(phone, { date: today(), count: 1 });
-  } else {
-    entry.count++;
+// Score de relevancia de un artículo vs. query
+function scoreArticle(art: Article, tokens: string[]): number {
+  const haystack = normalize(`${art.n} ${art.t} ${art.c}`);
+  let score = 0;
+  for (const tok of tokens) {
+    if (!haystack.includes(tok)) continue;
+    const hits = (haystack.match(new RegExp(tok, 'g')) || []).length;
+    if (normalize(art.n) === tok) score += 20;           // número exacto
+    else if (normalize(art.t).includes(tok)) score += 6 * hits; // en título
+    else score += hits;                                  // en contenido
   }
+  return score;
 }
 
-export function remainingQueries(rawPhone: string): number {
-  if (isPro(rawPhone)) return 999;
-  const phone = normalizePhone(rawPhone);
-  const entry = USAGE_MAP.get(phone);
-  if (!entry || entry.date !== today()) return FREE_LIMIT;
-  return Math.max(0, FREE_LIMIT - entry.count);
+// Búsqueda principal
+export function searchBase(query: string, srcFilter?: string, topN = 5): Article[] {
+  const tokens = normalize(query).split(' ')
+    .filter(w => w.length > 2 && !STOP.has(w));
+  if (!tokens.length) return [];
+
+  const pool = (baseRaw as any[]).map(a => ({
+    n: a.n, src: a.src, t: a.t || '', c: a.c
+  })) as Article[];
+
+  const filtered = srcFilter ? pool.filter(a => a.src === srcFilter) : pool;
+
+  const scored = filtered
+    .map(art => ({ art, score: scoreArticle(art, tokens) }))
+    .filter(x => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topN);
+
+  return scored.map(x => ({
+    ...x.art,
+    url: SRCS[x.art.src]?.url,
+  }));
 }
 
-export function getLimitMessage(): string {
-  const link = process.env.PAYMENT_LINK || 'https://wa.me/56929648142?text=Quiero+Plan+Pro';
-  return `⚠️ Alcanzaste tu límite de ${FREE_LIMIT} consultas gratuitas de hoy.\n\nPara continuar con consultas ilimitadas:\n👉 Plan Pro $99.000/mes\n${link}\n\nMañana se reinician tus consultas gratuitas. ✅`;
+// Formato de artículos para WhatsApp (texto plano)
+export function formatForWhatsApp(results: Article[]): string {
+  return results.map(a => {
+    const s = SRCS[a.src] || { label: a.src, url: '' };
+    const title = a.t ? `\n_${a.t}_` : '';
+    const content = a.c.length > 350 ? a.c.slice(0, 350) + '…' : a.c;
+    return `📋 Art. ${a.n} — ${s.label}${title}\n${content}\n🔗 ${s.url}`;
+  }).join('\n\n');
+}
+
+// Stats de la base
+export function getBaseStats() {
+  const pool = baseRaw as any[];
+  const counts: Record<string, number> = {};
+  for (const a of pool) counts[a.src] = (counts[a.src] || 0) + 1;
+  return { total: pool.length, bySource: counts };
 }

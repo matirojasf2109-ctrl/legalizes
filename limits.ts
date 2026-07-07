@@ -1,80 +1,71 @@
 // ═══════════════════════════════════════════════════
-//  Agente legal — llama a Claude con contexto local
+//  Rate limiting + suscripciones
+//  En Vercel serverless usamos un Map en memoria
+//  Para producción real → reemplazar con Redis/KV
 // ═══════════════════════════════════════════════════
 
-import Anthropic from '@anthropic-ai/sdk';
-import { searchBase, formatForWhatsApp } from './search';
+// Vercel KV (opcional) — descomenta si tienes @vercel/kv
+// import { kv } from '@vercel/kv';
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-const SYSTEM = `Eres Legalizes, agente jurídico especializado en derecho chileno. Creado por VibeCodingChile.
-
-REGLAS ESTRICTAS:
-- Responde SOLO sobre derecho chileno vigente
-- NUNCA inventes artículos, ROL de causas ni jurisprudencia
-- Siempre cita: nombre ley + número artículo + URL BCN verificable
-- Si no sabes o no tienes el artículo exacto, dilo claramente
-- Texto plano para WhatsApp (sin Markdown con asteriscos dobles)
-- Máximo 600 palabras por respuesta
-
-BASE NORMATIVA ACTIVA:
-- Código Civil (DFL-1/2000) → https://bcn.cl/S3XGRc
-- Código de Procedimiento Civil (Ley 1552) → https://bcn.cl/3lf95
-- Código Procesal Penal (Ley 19696) → https://bcn.cl/CSj9FH
-- Código del Trabajo (DFL-1/2003) → https://bcn.cl/2i6b1
-- Código Penal (1874) → https://bcn.cl/1pciT
-- Ley 21.719 datos personales → https://bcn.cl/gJo3hf
-
-FORMATO RESPUESTA WhatsApp:
-⚖️ [MATERIA LEGAL]
-
-[Análisis breve 2-3 oraciones]
-
-📋 [Norma] Art. XX — [título si existe]
-[texto del artículo]
-🔗 [URL BCN]
-
-✅ [Conclusión práctica 1-2 oraciones]
-
-⚠️ Información de referencia. Consulta a un abogado habilitado.`;
-
-// Historial en memoria por número (máx 6 mensajes = 3 intercambios)
-const HISTORY = new Map<string, Array<{ role: 'user' | 'assistant'; content: string }>>();
-
-export function clearHistory(phone: string) {
-  HISTORY.delete(phone);
+interface UsageEntry {
+  date: string;
+  count: number;
 }
 
-export async function askAgent(phone: string, userMessage: string): Promise<string> {
-  // 1. Buscar artículos relevantes en base local
-  const localResults = searchBase(userMessage, undefined, 4);
-  const localContext = localResults.length > 0
-    ? `\n\nARTÍCULOS RELEVANTES DE LA BASE LOCAL (cítalos si aplican):\n${formatForWhatsApp(localResults)}`
-    : '';
+// En memoria (se resetea en cada cold start de Vercel)
+// Para persistencia real usa Vercel KV o una DB
+const USAGE_MAP = new Map<string, UsageEntry>();
 
-  // 2. Historial del usuario
-  if (!HISTORY.has(phone)) HISTORY.set(phone, []);
-  const history = HISTORY.get(phone)!;
+const FREE_LIMIT = parseInt(process.env.FREE_LIMIT || '5');
 
-  const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [
-    ...history,
-    { role: 'user', content: userMessage + localContext },
-  ];
+// Números Pro separados por coma en env var
+function getProNumbers(): Set<string> {
+  const raw = process.env.PRO_NUMBERS || '';
+  return new Set(raw.split(',').map(n => n.trim()).filter(Boolean));
+}
 
-  // 3. Llamar a Claude
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 1024,
-    system: SYSTEM,
-    messages,
-  });
+function today(): string {
+  return new Date().toISOString().slice(0, 10);
+}
 
-  const reply = (response.content[0] as { text: string }).text;
+function normalizePhone(phone: string): string {
+  // Baileys entrega formato: 56912345678@s.whatsapp.net
+  return phone.replace('@s.whatsapp.net', '').replace('@c.us', '');
+}
 
-  // 4. Actualizar historial (máx 6 entradas)
-  history.push({ role: 'user', content: userMessage });
-  history.push({ role: 'assistant', content: reply });
-  if (history.length > 6) history.splice(0, history.length - 6);
+export function isPro(rawPhone: string): boolean {
+  const phone = normalizePhone(rawPhone);
+  const proNums = getProNumbers();
+  return proNums.has(phone) || proNums.has('+' + phone) || proNums.has(phone.replace(/\D/g, ''));
+}
 
-  return reply;
+export function canQuery(rawPhone: string): boolean {
+  if (isPro(rawPhone)) return true;
+  const phone = normalizePhone(rawPhone);
+  const entry = USAGE_MAP.get(phone);
+  if (!entry || entry.date !== today()) return true;
+  return entry.count < FREE_LIMIT;
+}
+
+export function incrementUsage(rawPhone: string): void {
+  const phone = normalizePhone(rawPhone);
+  const entry = USAGE_MAP.get(phone);
+  if (!entry || entry.date !== today()) {
+    USAGE_MAP.set(phone, { date: today(), count: 1 });
+  } else {
+    entry.count++;
+  }
+}
+
+export function remainingQueries(rawPhone: string): number {
+  if (isPro(rawPhone)) return 999;
+  const phone = normalizePhone(rawPhone);
+  const entry = USAGE_MAP.get(phone);
+  if (!entry || entry.date !== today()) return FREE_LIMIT;
+  return Math.max(0, FREE_LIMIT - entry.count);
+}
+
+export function getLimitMessage(): string {
+  const link = process.env.PAYMENT_LINK || 'https://wa.me/56929648142?text=Quiero+Plan+Pro';
+  return `⚠️ Alcanzaste tu límite de ${FREE_LIMIT} consultas gratuitas de hoy.\n\nPara continuar con consultas ilimitadas:\n👉 Plan Pro $99.000/mes\n${link}\n\nMañana se reinician tus consultas gratuitas. ✅`;
 }
